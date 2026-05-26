@@ -1,0 +1,19 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: load-generator
+  description: Locust-based load generator — drives realistic traffic against all microservices
+  annotations:
+    github.com/project-slug: nabilpurkar/intelliops-load-generator
+    backstage.io/techdocs-ref: dir:.
+  tags:
+    - testing
+    - locust
+  links:
+    - url: https://locust.infrastructurepath.online
+      title: Locust UI
+spec:
+  type: service
+  lifecycle: production
+  owner: platform-team
+  system: intelliops-sherlock
