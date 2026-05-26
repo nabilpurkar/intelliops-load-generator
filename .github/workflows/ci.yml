@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  SERVICE: load-generator
+  ECR_REPO: intelliops-dev/load-generator
+  REGISTRY: 007066145518.dkr.ecr.us-east-1.amazonaws.com
+  AWS_REGION: us-east-1
+  ROLE_ARN: arn:aws:iam::007066145518:role/github-actions-role
+  DEFECTDOJO_URL: https://defectdojo.infrastructurepath.online
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+
+  # ── Stage 1: Secret scanning ──────────────────────────────────────────────────
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Stage 2: SAST ─────────────────────────────────────────────────────────────
+  sast:
+    needs: [gitleaks]
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        run: semgrep scan --config=auto --sarif --output=semgrep.sarif . || true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+      - name: Upload to DefectDojo
+        if: always()
+        env:
+          DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+        run: |
+          [ -z "${DEFECTDOJO_API_KEY}" ] && exit 0
+          curl -sf -X POST "${DEFECTDOJO_URL}/api/v2/import-scan/" \
+            -H "Authorization: Token ${DEFECTDOJO_API_KEY}" \
+            -F "scan_type=SARIF" -F "file=@semgrep.sarif" \
+            -F "product_name=IntelliOps Sherlock" \
+            -F "engagement_name=CI - Semgrep (${SERVICE})" \
+            -F "auto_create_context=true" -F "active=true" -F "verified=false" \
+            -F "branch_tag=${{ github.sha }}" || true
+
+  # ── Stage 3: SCA ──────────────────────────────────────────────────────────────
+  sca:
+    needs: [sast]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+      - name: Upload to DefectDojo
+        if: always()
+        env:
+          DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+        run: |
+          [ -z "${DEFECTDOJO_API_KEY}" ] && exit 0
+          curl -sf -X POST "${DEFECTDOJO_URL}/api/v2/import-scan/" \
+            -H "Authorization: Token ${DEFECTDOJO_API_KEY}" \
+            -F "scan_type=SARIF" -F "file=@trivy-fs.sarif" \
+            -F "product_name=IntelliOps Sherlock" \
+            -F "engagement_name=CI - Trivy FS (${SERVICE})" \
+            -F "auto_create_context=true" -F "active=true" -F "verified=false" \
+            -F "branch_tag=${{ github.sha }}" || true
+
+  # ── Stage 4: Build → scan → sign → push (main only) ──────────────────────────
+  build-push:
+    needs: [sca]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+      - name: Build for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.REGISTRY }}/${{ env.ECR_REPO }}:scan-${{ github.sha }}
+          cache-from: type=gha,scope=${{ env.SERVICE }}
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.ECR_REPO }}:scan-${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+          ignore-unfixed: true
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-${{ env.SERVICE }}
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.ECR_REPO }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.ECR_REPO }}:latest
+          cache-from: type=gha,scope=${{ env.SERVICE }}
+          cache-to: type=gha,mode=max,scope=${{ env.SERVICE }}
+      - name: Sign image (keyless Cosign)
+        run: cosign sign --yes "${{ env.REGISTRY }}/${{ env.ECR_REPO }}@${{ steps.build-push.outputs.digest }}"
+
+  # ── Stage 5: Trigger platform manifest update ─────────────────────────────────
+  dispatch-deploy:
+    needs: [build-push]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          repository: nabilpurkar/intelliops-sherlock
+          event-type: manifest-update
+          client-payload: '{"service": "${{ env.SERVICE }}", "image_tag": "${{ github.sha }}", "actor": "${{ github.actor }}"}'
